@@ -1,0 +1,182 @@
+---
+title: "Causal ML"
+author: "Josia Schramm"
+date: "2024-03-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+df_orig <- read.csv("data/data.csv")
+library(tidyverse)
+library(DoubleML)
+library(mlr3)
+library(mlr3learners)
+library(ranger)
+```
+
+## 1.  define ATE and show its identification in a randomized controlled trial
+
+The Average Treatment Effect (ATE) measures the mean difference in potential outcomes between the treatment and control groups. It is defined as:
+
+$$
+ATE = E[Y(1) - Y(0)]
+$$
+
+where $E$ stands for the expected value, $Y(1)$ represents the potential outcome if the unit received the treatment, and $Y(0)$ represents the potential outcome if the unit did not receive the treatment.
+
+## 2. Extract Variables
+```{r }
+
+# summary(df_orig)
+
+# baseline characteristcs, treatment variable, outcome variables we want (chosen from the paper):
+# baseline:
+# MOMAGE, MOMPAR, Delivered_Mode, Birth_weight, Treat_time,
+# Cow_milk_60d, Honey, Infant_formula, Water_boil, BFEED Vitamin_drops, 
+
+# treatment variables
+# TX
+
+# outcomes:
+# DEATH, SEPSIS, SEPSISA, SEPSISB, SEPSISC, SEPSISDEATH, 
+# DIARRHEA, ABSCESS, OMPHA
+
+
+df <- df_orig %>% 
+  dplyr::select(MOMAGE, MOMPAR, Delivered_Mode, Birth_weight, Treat_time, Cow_milk_60d, Honey, Infant_formula, Water_boil, BFEED, Vitamin_drops, TX, DEATH, SEPSIS, SEPSISB, SEPSISC, SEPSISDEATH, DIARRHEA, ABSCESS, OMPHA)
+
+# sapply(df, table)
+# sapply(df, class)
+
+# Clean :
+# 1. Delivered_Mode to regular birth/assisted birth
+# 2. Treat_time to 2 or less, 3 or more
+# 3. BFEED to <1 hr, > 1hr
+# 4. change Cow_milk_60d, Honey, Infant_formula, Water_boil, Vitamin_drops, TX, DEATH, SEPSIS, SEPSISB, SEPSISC, SEPSISDEATH, DIARRHEA, ABSCESS, OMPHA
+
+df <- df %>% 
+  mutate(Delivered_Mode = ifelse(Delivered_Mode == "Assisted vagin"|Delivered_Mode == "C-section", "Assisted delivery", Delivered_Mode)) %>% 
+  mutate(Treat_time = as.character(ifelse(Treat_time < 3, 0, 1))) %>% 
+  mutate(Treat_time = ifelse(Treat_time == "0", "Treatment start < 2d after birth", "Treatment start > 2d after birth")) %>% 
+  mutate(BFEED = ifelse(BFEED != "Immediately < 1 hour after", "< 1 hour after birth", BFEED)) %>% 
+  mutate(BFEED = ifelse(BFEED == "Immediately < 1 hour after", "> 1 hour after birth", BFEED)) %>%
+  mutate(TX_num = TX) %>% 
+  mutate(SEPSISDEATH_num = SEPSISDEATH) %>% 
+  mutate(across(c(Cow_milk_60d, Honey, Infant_formula, Water_boil, Vitamin_drops, TX, DEATH, SEPSIS, SEPSISB, SEPSISC, SEPSISDEATH, DIARRHEA, ABSCESS, OMPHA), as.factor)) %>% 
+  drop_na()
+  
+# sapply(df, table)
+# sapply(df, class)
+
+
+
+```
+
+
+## 3. descriptive statistics
+```{r }
+vars <- c("MOMAGE","MOMPAR","Delivered_Mode","Birth_weight","Treat_time",  
+"Cow_milk_60d","Honey", "Infant_formula","Water_boil","BFEED"         
+ ,"Vitamin_drops","DEATH", "SEPSIS","SEPSISB" , "SEPSISC" , "SEPSISDEATH"  ,  "DIARRHEA" ,      "ABSCESS", "OMPHA")
+
+
+t1 <- tableone::CreateTableOne(vars = vars,
+                               strata = "TX",
+                               data = df,
+                               smd = TRUE)
+t1_print <- print(t1)
+
+
+```
+## 4. ATE 
+
+```{r }
+# ATE via mean comparison and univariable OLS to get CIs
+ATE_mean <- mean(df[df$TX_num ==1,]$SEPSISDEATH_num)- mean(df[df$TX_num ==0,]$SEPSISDEATH_num)
+
+OLS_for_CI <- lm(SEPSISDEATH_num ~ TX_num, data = df)
+confint_1 <- confint(OLS_for_CI)
+lower_CI_1 <- confint_1[2,1]
+upper_CI_1 <- confint_1[2,2]
+
+# ATQ via OLS
+OLS_ATE_reg <- lm(SEPSISDEATH_num~TX_num+ MOMAGE+ MOMPAR+ Birth_weight+ BFEED, data = df)
+ATE_OLS <- OLS_ATE_reg$coefficients[2]
+
+confint_2 <- confint(OLS_ATE_reg)
+lower_CI_2 <- confint_2[2,1]
+upper_CI_2 <- confint_2[2,2]
+
+# ATE via partial linear regression via DoubleML
+
+df_prep <- df %>% 
+  select(TX_num, SEPSISDEATH_num, MOMAGE, MOMPAR, Delivered_Mode, Birth_weight, Treat_time, Cow_milk_60d, Honey, Infant_formula, Water_boil, BFEED, Vitamin_drops)
+
+learner = lrn("regr.ranger", num.trees = 100, mtry = 5, min.node.size = 2, max.depth = 5)
+ml_l = learner$clone()
+ml_m = learner$clone()
+
+obj_dml_data = DoubleMLData$new(df_prep, y_col="SEPSISDEATH_num", d_cols="TX_num")
+dml_plr_obj = DoubleMLPLR$new(obj_dml_data, ml_l, ml_m)
+dml_plr_obj$fit()
+
+PLR_ATE <- dml_plr_obj$coef
+lower_CI_3 <- dml_plr_obj$coef - (1.96*dml_plr_obj$se)
+upper_CI_3 <- dml_plr_obj$coef + (1.96*dml_plr_obj$se)
+
+# ATE via AIPW
+
+ml_g = lrn("regr.ranger", num.trees = 100, mtry = 5, min.node.size = 2, max.depth = 5)
+ml_m = lrn("classif.ranger", num.trees = 100, mtry = 5, min.node.size = 2, max.depth = 5)
+obj_dml_data = DoubleMLData$new(df_prep, y_col="SEPSISDEATH_num", d_cols="TX_num")
+dml_irm_obj = DoubleMLIRM$new(obj_dml_data, ml_g, ml_m)
+dml_irm_obj$fit()
+
+AIPW_ATE <- dml_irm_obj$coef
+lower_CI_4 <- dml_irm_obj$coef - (1.96*dml_irm_obj$se)
+upper_CI_4 <- dml_irm_obj$coef + (1.96*dml_irm_obj$se)
+
+```
+
+
+
+## 5. Plot CIs for different methods
+```{r }
+ATE_data <- data.frame(
+  Method = c("Mean Comparison", "OLS", "PLR", "AIPW"),
+  Estimate = c(ATE_mean, ATE_OLS, PLR_ATE, AIPW_ATE),
+  CI_lower = c(lower_CI_1, lower_CI_2, lower_CI_3, lower_CI_4),
+  CI_upper = c(upper_CI_1, upper_CI_2, upper_CI_3, upper_CI_4)
+)
+
+
+ggplot(ATE_data, aes(x=Method, y=Estimate, ymin=CI_lower, ymax=CI_upper)) +
+  geom_point() +
+  geom_errorbar(width=0.2) +
+  theme_minimal() +
+  labs(title="Comparison of ATE Estimates with Confidence Intervals",
+       x="Method",
+       y="ATE Estimate")
+```
+
+
+
+
+## 6. Discuss results
+
+The results make sense, since we have randomized the treatment, and we do not expect confounders to be present. This means that we can read the correct effects simply by doing a mean comparison, and do not expect a change when using more sophisticated methods.
+
+## 7. Estimate CATE using causal_forest()
+```{r }
+df_causalf <- df_prep %>% 
+  select(-SEPSISDEATH_num, -TX_num, -Treat_time, -BFEED, -Delivered_Mode) %>% 
+  mutate(across(c(Cow_milk_60d, Honey, Infant_formula, Water_boil, Vitamin_drops),as.numeric))
+
+sapply(df_prep, class)
+
+tau.forest <- grf::causal_forest(df_causalf, df_prep$SEPSISDEATH_num, df_prep$TX_num)
+
+CATE <- grf::average_treatment_effect(tau.forest, target.sample = "all")
+
+```
